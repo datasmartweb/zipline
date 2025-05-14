@@ -1,0 +1,1201 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import asyncio
+import requests
+import websockets
+import nest_asyncio
+import joblib
+import time
+import pandas_profiling
+from collections import deque
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
+from tensorflow.keras.optimizers import Adam
+import pandas_ta as ta
+from time import sleep
+import threading
+
+# --- CONFIGURACIÓN GENERAL ---
+TIMEFRAME_MINUTES = 3  # Cambia aquí: 1, 2, 3, 4, 5...
+
+SYMBOL = "R_10"
+API_TOKEN = os.getenv("API_TOKEN", "MQ29nAcYcjGowkR")
+URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+MAX_OPERATIONS = 100
+HIST_CANDLES = 50000
+
+HIST_FILE = f'velas_{SYMBOL}_{TIMEFRAME_MINUTES}m.csv'
+MODEL_FILE = f'nn_trading_model_{TIMEFRAME_MINUTES}m.h5'
+RF_FILE = f'rf_trading_model_{TIMEFRAME_MINUTES}m.pkl'
+XGB_FILE = f'xgb_trading_model_{TIMEFRAME_MINUTES}m.pkl'
+STACK_FILE = f'stacking_model_{TIMEFRAME_MINUTES}m.pkl'
+THRESHOLD_FILE = f'decision_threshold_{TIMEFRAME_MINUTES}m.json'
+FEATURES_FILE = f'features_used_{TIMEFRAME_MINUTES}m.json'
+SCALER_FILE = f'scaler_{TIMEFRAME_MINUTES}m.pkl'
+VELAS_LIVE_FILE = f'velas_vivo_{TIMEFRAME_MINUTES}m.csv'
+OPERACIONES_FILE = f'registro_operaciones_{TIMEFRAME_MINUTES}m.csv'
+BEST_HOURS_FILE = f'mejores_horas_{TIMEFRAME_MINUTES}m.json'
+
+DURATION = TIMEFRAME_MINUTES
+GRANULARITY = TIMEFRAME_MINUTES * 60
+
+MAX_LOSSES_IN_A_ROW = int(os.getenv("MAX_LOSSES_IN_A_ROW", "30"))
+STOP_LOSS_DAILY = float(os.getenv("STOP_LOSS_DAILY", "0.3"))
+DRAWDOWN_THRESHOLD = float(os.getenv("DRAWDOWN_THRESHOLD", "0.15"))
+MIN_PROFIT = 0.05
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8171613790:AAEBFMHz3qttu6meq7-5Ou0HGS_fLHZXXTY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "631832285")
+ADX_MIN_LIVE = 10  # o 20, ajusta según tus experimentos
+BUFFER_SIZE = 100
+
+MAX_RECONNECT_ATTEMPTS = 10
+BASE_RECONNECT_DELAY = 5   # segundos
+MAX_RECONNECT_DELAY = 120  # segundos
+
+nest_asyncio.apply()
+
+# --- FUNCIONES DE PARSEO DE TICK ---
+def parse_price(msg):
+    return float(msg["tick"]["quote"])
+
+def parse_time_bucket(msg):
+    epoch = int(msg["tick"]["epoch"])
+    dt = datetime.utcfromtimestamp(epoch)
+    bucket_minute = (dt.minute // TIMEFRAME_MINUTES) * TIMEFRAME_MINUTES
+    return dt.replace(second=0, microsecond=0, minute=bucket_minute)
+
+def round_down_to_timeframe(dt):
+    return dt - timedelta(
+        minutes=dt.minute % TIMEFRAME_MINUTES,
+        seconds=dt.second,
+        microseconds=dt.microsecond
+    )
+
+
+# --- PARAMETRIZACIÓN DE FILTROS ---
+RSI_CALL_MIN = 10    # baja el mínimo para que casi siempre pase
+RSI_PUT_MAX = 90     # sube el máximo para lo mismo
+MICRO_TICK_IMBALANCE_CALL = -10  # bajísimo, deja pasar todo
+MICRO_TICK_IMBALANCE_PUT = 10    # altísimo, deja pasar todo
+MICRO_BUYSELL_CALL = -1          # deja pasar todo
+MICRO_BUYSELL_PUT = 1            # deja pasar todo
+MICRO_DIRECTION_CHANGE = 1       # deja pasar todo
+
+
+# --- SWITCH para activar/desactivar filtros ---
+FILTRO_RSI = False
+FILTRO_MICRO = False
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        print("Telegram status:", resp.status_code, resp.text)
+    except Exception as e:
+        print(f"❌ Error enviando alerta a Telegram: {e}")
+
+# Prueba manual
+send_telegram_alert("🚨 Prueba de alerta desde el bot.")
+
+
+# --- MAIN VELAS CON RECONEXIÓN AUTOMÁTICA ---
+async def main_ver_vela_print():
+    current = None
+    bar = None
+    while True:
+        try:
+            async with websockets.connect(URL) as ws:
+                await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+                while True:
+                    tick_msg = await ws.recv()
+                    msg = json.loads(tick_msg)
+                    if not ("tick" in msg and "quote" in msg["tick"]):
+                        continue
+                    price = parse_price(msg)
+                    tick_time = parse_time_bucket(msg)
+                    if current is None:
+                        current = tick_time
+                        bar = {'open': price, 'high': price, 'low': price, 'close': price}
+                    elif tick_time > current:
+                        print(f"🕒 Vela {TIMEFRAME_MINUTES}m {current.strftime('%Y-%m-%d %H:%M:%S')} | "
+                              f"O: {bar['open']:.2f} H: {bar['high']:.2f} L: {bar['low']:.2f} C: {bar['close']:.2f}")
+                        current = tick_time
+                        bar = {'open': price, 'high': price, 'low': price, 'close': price}
+                    else:
+                        bar['high'] = max(bar['high'], price)
+                        bar['low'] = min(bar['low'], price)
+                        bar['close'] = price
+        except websockets.ConnectionClosedError:
+            await asyncio.sleep(300)
+        except Exception:
+            await asyncio.sleep(300)
+
+
+# --- NUEVOS INDICADORES DE MICROESTRUCTURA (para DataFrame histórico y en vivo) ---
+def add_microstructure_features(df, price_col="close", window=20, accel_window=10, density_window=50):
+    df = df.copy()
+    # Tick direction: +1 si sube, -1 si baja, 0 si igual
+    df["tick_direction"] = np.sign(df[price_col].diff())
+    # Tick imbalance: suma de direcciones en ventana corta
+    df["tick_imbalance"] = df["tick_direction"].rolling(window).sum()
+    # Presión: promedio de direcciones recientes
+    df["buy_sell_pressure"] = df["tick_direction"].rolling(window).mean()
+    # Volatilidad local
+    df["micro_volatility"] = df[price_col].rolling(window).std()
+    # Aceleración (segunda derivada)
+    velocity = df[price_col].diff()
+    acceleration = velocity.diff()
+    df["price_acceleration"] = acceleration.rolling(accel_window).mean()
+    # Densidad de cambios de dirección
+    direction_changes = (df["tick_direction"].shift(-1) != df["tick_direction"]).astype(int)
+    df["direction_change_density"] = direction_changes.rolling(density_window).mean()
+    return df
+
+
+def advanced_feature_engineering(df):
+    df = df.copy()
+    for period in [3, 7, 14, 21]:
+        df[f'rsi_{period}'] = ta.rsi(df['close'], length=period)
+    for period in [7, 14, 21]:
+        df[f'atr_{period}'] = ta.atr(df['high'], df['low'], df['close'], length=period)
+        adx = ta.adx(df['high'], df['low'], df['close'], length=period)
+        df[f'adx_{period}'] = adx[f'ADX_{period}']
+        df[f'cci_{period}'] = ta.cci(df['high'], df['low'], df['close'], length=period)
+        df[f'williams_{period}'] = ta.willr(df['high'], df['low'], df['close'], length=period)
+    stochrsi = ta.stochrsi(df['close'])
+    if stochrsi is not None:
+        df['stochrsi_k'] = stochrsi['STOCHRSIk_14_14_3_3']
+        df['stochrsi_d'] = stochrsi['STOCHRSId_14_14_3_3']
+    for period in [5, 10, 20, 50, 100]:
+        df[f'sma_{period}'] = ta.sma(df['close'], length=period)
+        df[f'ema_{period}'] = ta.ema(df['close'], length=period)
+    bb = ta.bbands(df['close'], length=20)
+    df['bb_upper'] = bb['BBU_20_2.0']
+    df['bb_middle'] = bb['BBM_20_2.0']
+    df['bb_lower'] = bb['BBL_20_2.0']
+    macd = ta.macd(df['close'])
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
+    df['macd_hist'] = macd['MACDh_12_26_9']
+    df['roc_10'] = ta.roc(df['close'], length=10)
+    df['mom_10'] = ta.mom(df['close'], length=10)
+    df['volatility_10'] = df['close'].rolling(10).std()
+    df['volatility_20'] = df['close'].rolling(20).std()
+    df['close_ema10_ratio'] = df['close'] / (df['ema_10'] + 1e-9)
+    df['close_sma20_ratio'] = df['close'] / (df['sma_20'] + 1e-9)
+    df['price_position_in_band'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'] + 1e-9)
+    df['close_rolling_mean_10'] = df['close'].rolling(10).mean()
+    df['close_rolling_std_10'] = df['close'].rolling(10).std()
+    df['close_rolling_min_10'] = df['close'].rolling(10).min()
+    df['close_rolling_max_10'] = df['close'].rolling(10).max()
+    df['close_pct_change_5'] = df['close'].pct_change(5)
+    df['high_low_range'] = df['high'] - df['low']
+    df['body'] = abs(df['close'] - df['open'])
+    df['upper_shadow'] = df['high'] - np.maximum(df['close'], df['open'])
+    df['lower_shadow'] = np.minimum(df['close'], df['open']) - df['low']
+    df['diff_close'] = df['close'].diff()
+    df['diff_ema10'] = df['ema_10'].diff()
+    for N in [3, 5, 10]:
+        df[f'perc_bull_{N}'] = df['close'].rolling(N).apply(lambda x: np.sum(x > x.shift(1)) / N if len(x.dropna()) == N else np.nan, raw=False)
+        df[f'perc_bear_{N}'] = df['close'].rolling(N).apply(lambda x: np.sum(x < x.shift(1)) / N if len(x.dropna()) == N else np.nan, raw=False)
+
+    # --- NUEVO: microestructura ---
+    df = add_microstructure_features(df, price_col="close", window=20, accel_window=10, density_window=50)
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna()
+    return df
+
+def preparar_datos_modelo(df, label_column='target'):
+    df = df.copy()
+    df.dropna(inplace=True)
+    features = [col for col in df.columns if col not in ['time', 'open', 'high', 'low', 'close', label_column]]
+    with open(FEATURES_FILE, 'w') as f:
+        json.dump(features, f)
+    X = df[features]
+    y = df[label_column]
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    joblib.dump(scaler, SCALER_FILE)
+    print(f"✅ Datos preparados con {len(features)} features y {len(X_scaled)} muestras.")
+    return X_scaled, y
+
+def define_target(df, lookahead=2, atr_period=14, atr_mult=0.05):
+    df = df.copy()
+    df['target'] = -1
+    c = df['close'].values
+    atr = ta.atr(df['high'], df['low'], df['close'], length=atr_period).values
+    for i in range(len(c) - lookahead):
+        move = (c[i+lookahead] - c[i]) / c[i]
+        threshold = (atr[i] * atr_mult) / c[i] if not np.isnan(atr[i]) else 0
+        if move > threshold:
+            df.iloc[i, df.columns.get_loc('target')] = 1
+        elif move < -threshold:
+            df.iloc[i, df.columns.get_loc('target')] = 0
+    return df
+
+def balance_data(X, y):
+    counts = np.bincount(y)
+    ratio = min(counts) / max(counts)
+    if ratio < 0.5:
+        smote = SMOTE()
+        X_bal, y_bal = smote.fit_resample(X, y)
+        print("🔄 SMOTE aplicado (oversampling).")
+    else:
+        rus = RandomUnderSampler()
+        X_bal, y_bal = rus.fit_resample(X, y)
+        print("🔄 Submuestreo aplicado (undersampling).")
+    return X_bal, y_bal
+
+def build_deep_nn(input_dim, lr=0.001, dropout=0.3):
+    model = Sequential([
+        Input(shape=(input_dim,)),
+        Dense(128, activation='relu'),
+        BatchNormalization(),
+        Dropout(dropout),
+        Dense(64, activation='relu'),
+        BatchNormalization(),
+        Dropout(dropout),
+        Dense(32, activation='relu'),
+        Dropout(dropout/2),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(lr), loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def stacking_ensemble_predict(X, nn_model, rf_model, xgb_model, stack_model):
+    nn_pred = nn_model.predict(X).flatten()
+    rf_pred = rf_model.predict_proba(X)[:, 1]
+    xgb_pred = xgb_model.predict_proba(X)[:, 1]
+    meta_X = np.column_stack([nn_pred, rf_pred, xgb_pred])
+    return stack_model.predict_proba(meta_X)[:, 1]
+
+def optimize_balanced_thresholds(probs, y_true, min_precision=0.6, min_signals=10):
+    thresholds = np.arange(0.15, 0.9, 0.01)
+    best_call, best_put = 0.7, 0.2
+    best_balance = 0
+    best_stats = {}
+    for t_call in thresholds:
+        for t_put in thresholds:
+            if t_put >= t_call:
+                continue
+            pred = np.full_like(probs, fill_value=-1)
+            pred[probs >= t_call] = 1
+            pred[probs <= t_put] = 0
+            mask = pred != -1
+            if np.sum(mask) < min_signals:
+                continue
+            call_mask = (pred == 1)
+            put_mask = (pred == 0)
+            if np.sum(call_mask) < min_signals or np.sum(put_mask) < min_signals:
+                continue
+            prec_call = precision_score(y_true[call_mask], pred[call_mask], zero_division=0)
+            prec_put  = precision_score(y_true[put_mask], pred[put_mask], zero_division=0)
+            if prec_call < min_precision or prec_put < min_precision:
+                continue
+            n_call = np.sum(call_mask)
+            n_put = np.sum(put_mask)
+            balance = 1.0 - abs(n_call - n_put) / (n_call + n_put)
+            if balance > best_balance:
+                best_balance = balance
+                best_call = t_call
+                best_put = t_put
+                best_stats = dict(n_call=n_call, n_put=n_put, prec_call=prec_call, prec_put=prec_put)
+    print(f"Thresholds óptimos balanceados: CALL>={best_call:.2f} [{best_stats.get('n_call',0)} señales, {best_stats.get('prec_call',0):.2f} precisión], "
+          f"PUT<={best_put:.2f} [{best_stats.get('n_put',0)} señales, {best_stats.get('prec_put',0):.2f} precisión], "
+          f"Balance={best_balance:.3f}")
+    return best_call, best_put
+
+def cargar_mejores_horas():
+    if not os.path.exists(BEST_HOURS_FILE):
+        return list(range(24))
+    with open(BEST_HOURS_FILE) as f:
+        best_hours = json.load(f)
+    if not best_hours:
+        return list(range(24))
+    return best_hours
+
+def validate_data(data):
+    if np.any(np.isnan(data)):
+        data = np.nan_to_num(data, nan=0.0)
+    if np.any(np.isinf(data)):
+        data = np.nan_to_num(data, posinf=1e6, neginf=-1e6)
+    return data
+
+def calcular_umbral_volatilidad_dinamico(df, window=200, percentil=10, min_val=0.2):
+    atr_rel = (df['atr_14'] / df['close']).dropna()
+    if len(atr_rel) < window:
+        return min_val
+    recent = atr_rel[-window:]
+    return max(np.percentile(recent, percentil), min_val)
+
+async def download_candles(symbol=SYMBOL, granularity=GRANULARITY, total=HIST_CANDLES, output_file=HIST_FILE):
+    all_candles = []
+    latest_epoch = None
+    candles_needed = total
+    MAX_PER_REQUEST = 1000
+    async with websockets.connect(URL) as ws:
+        while candles_needed > 0:
+            count = min(MAX_PER_REQUEST, candles_needed)
+            req = {
+                "ticks_history": symbol,
+                "count": count,
+                "style": "candles",
+                "granularity": granularity,
+            }
+            if latest_epoch is not None:
+                req["end"] = latest_epoch - 1
+            else:
+                req["end"] = int(time.time())
+            await ws.send(json.dumps(req))
+            msg = await ws.recv()
+            data = json.loads(msg)
+            if "candles" not in data:
+                print("❌ Error al descargar velas:", data)
+                break
+            candles = data["candles"]
+            if not candles:
+                break
+            all_candles = candles + all_candles
+            candles_needed -= len(candles)
+            latest_epoch = candles[0]["epoch"]
+            print(f"Descargadas: {len(candles)} | Total acumulado: {len(all_candles)}")
+            if len(candles) < count:
+                break
+    if not all_candles:
+        print("❌ No se descargó ninguna vela.")
+        return
+    df = pd.DataFrame(all_candles)
+    if 'epoch' in df.columns:
+        df.rename(columns={"epoch": "time"}, inplace=True)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df[["time", "open", "high", "low", "close"]]
+    df.sort_values("time", inplace=True)
+    df.to_csv(output_file, index=False)
+    print(f"✅ Histórico guardado en {output_file}")
+    send_telegram_alert(f"✅ Histórico guardado en {output_file}")
+
+def round_down_to_3min(dt):
+    return dt - timedelta(minutes=dt.minute % 3, seconds=dt.second, microseconds=dt.microsecond)
+
+async def get_balance(ws):
+    await ws.send(json.dumps({"balance": 1}))
+    while True:
+        msg = await ws.recv()
+        data = json.loads(msg)
+        if data.get("msg_type") == "balance":
+            if isinstance(data["balance"], dict) and "balance" in data["balance"]:
+                return float(data["balance"]["balance"])
+            elif isinstance(data["balance"], (float, int, str)):
+                return float(data["balance"])
+            else:
+                return 0.0
+        if data.get("msg_type") == "authorize" and "balance" in data.get("authorize", {}):
+            return float(data["authorize"]["balance"])
+
+async def ejecutar_operacion_deriv(ws, tipo, monto):
+    proposal_req = {
+        "proposal": 1,
+        "amount": f"{monto:.2f}",
+        "basis": "stake",
+        "contract_type": tipo,
+        "currency": "USD",
+        "duration": f"{DURATION}",
+        "duration_unit": "m",
+        "symbol": SYMBOL
+    }
+    await ws.send(json.dumps(proposal_req))
+    while True:
+        response = await ws.recv()
+        proposal = json.loads(response)
+        if proposal.get("msg_type") == "proposal" and "proposal" in proposal:
+            proposal_id = proposal["proposal"]["id"]
+            break
+        elif proposal.get("error"):
+            print(f"❌ Error en proposal: {proposal['error']['message']}")
+            send_telegram_alert(f"❌ Error en proposal: {proposal['error']['message']}")
+            return None
+        else:
+            continue
+    buy_req = {"buy": proposal_id, "price": f"{monto:.2f}"}
+    await ws.send(json.dumps(buy_req))
+    while True:
+        buy_resp = await ws.recv()
+        resp = json.loads(buy_resp)
+        if resp.get("msg_type") == "buy":
+            buy_id = resp["buy"].get("contract_id", resp["buy"].get("transaction_id"))
+            return buy_id
+        elif resp.get("error"):
+            print(f"❌ Error en buy: {resp['error']['message']}")
+            send_telegram_alert(f"❌ Error en buy: {resp['error']['message']}")
+            return None
+        else:
+            continue
+
+async def esperar_resultado_operacion(ws, contract_id, stake):
+    await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1, "contract_id": contract_id}))
+    while True:
+        msg = await ws.recv()
+        data = json.loads(msg)
+        if data.get("msg_type") == "proposal_open_contract":
+            contract = data.get("proposal_open_contract", {})
+            if contract.get("contract_id", None) == contract_id:
+                if contract.get("is_sold"):
+                    profit = contract.get("profit")
+                    status = "ganada" if profit > 0 else "perdida"
+                    print(f"✅ Operación {status}. Resultado: {profit:+.2f} USD")
+                    send_telegram_alert(f"✅ Operación {status}. Resultado: {profit:+.2f} USD")
+                    return profit, status
+
+def train_and_validate():
+    try:
+        # Paso 1: Verificar si el archivo histórico existe
+        if not os.path.exists(HIST_FILE):
+            print(f"📥 Descargando histórico de velas para {SYMBOL} ...")
+            asyncio.run(download_candles())
+
+        # Paso 2: Cargar y validar datos
+        df = pd.read_csv(HIST_FILE)
+        if 'time' not in df.columns:
+            raise ValueError(f"❌ El archivo {HIST_FILE} NO contiene la columna 'time'. Columnas: {df.columns.tolist()}")
+
+        df['time'] = pd.to_datetime(df['time'])
+        df = df.set_index('time')
+
+        # Paso 3: Ingeniería de características
+        df = advanced_feature_engineering(df)
+
+        # Paso 4: Definir variable objetivo
+        df = define_target(df, lookahead=2)
+        df = df[df['target'] != -1]
+
+        # Paso 5: Selección de características
+        features = [c for c in df.columns if c != 'target']
+        df = df[features + ['target']].dropna()
+
+        # Paso 6: Escalado
+        X = df[features].values
+        y = df['target'].values
+        X = validate_data(X)  # limpia NaN e infinitos si los hay
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        joblib.dump(scaler, SCALER_FILE)
+
+        # Paso 7: Balanceo de datos
+        X_bal, y_bal = balance_data(X_scaled, y)
+
+        # Paso 8: Entrenamiento de modelos base
+        rf = RandomForestClassifier(n_estimators=150, max_depth=8, class_weight='balanced', random_state=42)
+        xgb = XGBClassifier(n_estimators=150, max_depth=8, learning_rate=0.04,
+                            use_label_encoder=False, eval_metric='logloss')
+
+        rf.fit(X_bal, y_bal)
+        xgb.fit(X_bal, y_bal)
+        joblib.dump(rf, RF_FILE)
+        joblib.dump(xgb, XGB_FILE)
+
+        # Paso 9: Entrenar red neuronal
+        nn_model = build_deep_nn(X_bal.shape[1], lr=0.001, dropout=0.2)
+        nn_model.fit(X_bal, y_bal, epochs=30, batch_size=32, verbose=0)
+        nn_model.save(MODEL_FILE)
+
+        # Paso 10: Predicciones para ensamble
+        nn_pred = nn_model.predict(X_bal).flatten()
+        rf_pred = rf.predict_proba(X_bal)[:, 1]
+        xgb_pred = xgb.predict_proba(X_bal)[:, 1]
+
+        meta_X = np.column_stack([nn_pred, rf_pred, xgb_pred])
+        stack_model = LogisticRegression()
+        stack_model.fit(meta_X, y_bal)
+        joblib.dump(stack_model, STACK_FILE)
+
+        # Paso 11: Ajuste de umbrales
+        probs = stacking_ensemble_predict(X_bal, nn_model, rf, xgb, stack_model)
+        best_call, best_put = optimize_balanced_thresholds(probs, y_bal, min_precision=0.60, min_signals=15)
+
+        with open(THRESHOLD_FILE, 'w') as f:
+            json.dump({'threshold_call': float(best_call), 'threshold_put': float(best_put)}, f)
+
+        with open(FEATURES_FILE, 'w') as f:
+            json.dump(features, f)
+
+        # Paso 12: Resumen
+        print(f"🎯 Entrenamiento completo.\nCALL={best_call:.2f} | PUT={best_put:.2f}")
+        print("📊 Balance de la variable objetivo:\n", df['target'].value_counts())
+        send_telegram_alert(f"🎯 Entrenamiento completo. Umbrales óptimos:\nCALL={best_call:.2f} / PUT={best_put:.2f}\nFeatures: {features}")
+
+        return features
+
+    except Exception as e:
+        print(f"❌ Error en train_and_validate: {e}")
+        send_telegram_alert(f"❌ Error en train_and_validate: {str(e)}")
+        return None
+
+
+def analizar_operaciones_equity():
+    try:
+        import matplotlib.pyplot as plt
+        df = pd.read_csv(OPERACIONES_FILE, names=['datetime', 'tipo_senal', 'monto', 'probabilidad', 'resultado', 'profit'])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime')
+        saldo_inicial = 1000
+        equity = [saldo_inicial]
+        for p in df['profit']:
+            equity.append(equity[-1] + p)
+        df['equity'] = equity[1:]
+        plt.figure(figsize=(12,5))
+        plt.plot(df['datetime'], df['equity'], marker='o')
+        plt.title('Curva de Equity')
+        plt.xlabel('Fecha/Hora')
+        plt.ylabel('Equity (USD)')
+        plt.grid(True)
+        plt.show()
+        print(f"Saldo inicial: {saldo_inicial:.2f} USD")
+        print(f"Saldo final: {equity[-1]:.2f} USD")
+        print(f"Total operaciones: {len(df)}")
+        df['hora'] = df['datetime'].dt.hour
+        perdidas = df[df['resultado'].str.upper().str.contains('PERDIDA')]
+        horas_perdida = perdidas['hora'].value_counts().sort_index()
+        plt.figure(figsize=(10,5))
+        horas_perdida.plot(kind='bar')
+        plt.title('Operaciones Perdidas por Hora')
+        plt.xlabel('Hora (UTC)')
+        plt.ylabel('Cantidad de Pérdidas')
+        plt.show()
+        puts_perdida = df[(df['tipo_senal'] == 'PUT') & (df['resultado'].str.upper().str.contains('PERDIDA'))]
+        puts_total = df[df['tipo_senal'] == 'PUT']
+        print(f"Total PUT: {len(puts_total)}")
+        print(f"Pérdidas PUT: {len(puts_perdida)} ({len(puts_perdida)/max(1,len(puts_total))*100:.2f}%)")
+        if not puts_perdida.empty:
+            print("Probabilidades en las PUT perdidas:")
+            print(puts_perdida['probabilidad'].describe())
+            print("\nSUGERENCIA: Si la mayoría de las PUT perdidas tienen probabilidad baja, considera subir el threshold_put y reentrenar/testear.")
+    except Exception as e:
+        print(f"❌ Error al analizar operaciones equity: {e}")
+
+def guardar_operacion(datetime_str, signal, monto, prob, status, profit):
+    header = "datetime,tipo_senal,monto,probabilidad,resultado,profit\n"
+    write_header = not os.path.exists(OPERACIONES_FILE) or os.stat(OPERACIONES_FILE).st_size == 0
+    with open(OPERACIONES_FILE, "a") as f:
+        if write_header:
+            f.write(header)
+        f.write(f"{datetime_str},{signal},{monto},{prob:.4f},{status},{profit}\n")
+
+# --- Signal function (con microestructura) ---
+def signal_fn(features_row, model=None, scaler=None):
+    X = features_row.drop(columns=['time'], errors='ignore').values
+    if scaler is not None:
+        X = scaler.transform(X)
+    prob = model.predict_proba(X)[0,1] if model is not None else 0.5
+    # Decisión simple
+    if prob > 0.7:
+        signal = "CALL"
+    elif prob < 0.3:
+        signal = "PUT"
+    else:
+        signal = None
+    last = features_row.iloc[0]
+    # Filtros microestructura
+    passed = True
+    if signal == 'CALL':
+        passed = (
+            last['tick_imbalance'] > 3 and
+            last['buy_sell_pressure'] > 0.2 and
+            last['price_acceleration'] > 0 and
+            last['micro_volatility'] > 1e-4 * last['close'] and
+            last['direction_change_density'] < 0.5
+        )
+    elif signal == 'PUT':
+        passed = (
+            last['tick_imbalance'] < -3 and
+            last['buy_sell_pressure'] < -0.2 and
+            last['price_acceleration'] < 0 and
+            last['micro_volatility'] > 1e-4 * last['close'] and
+            last['direction_change_density'] < 0.5
+        )
+    if not passed:
+        signal = None
+    return signal, prob
+
+# --- Gestión de riesgo (Kelly + mínimo fijo) ---
+def risk_fn(balance, prob, signal, kelly_fraction=1.0, base_fraction=0.05):
+    if not signal:
+        return 0
+    edge = 2*prob - 1 if signal in ["CALL", "PUT"] else 0
+    kelly = max(edge, 0) * kelly_fraction
+    bet = balance * max(kelly, base_fraction)
+    return min(bet, balance)
+
+# --- Backtest tick por tick ---
+def backtest_tick_by_tick(df_ticks, features_fn, model, scaler, initial_balance=1000, buffer_size=100, verbose=True):
+    balance = initial_balance
+    max_balance = initial_balance
+    equity_curve = []
+    log = []
+    buffer = deque(maxlen=buffer_size)
+    last_bar_time = None
+    for i, row in df_ticks.iterrows():
+        bar_time = row['time']
+        price = row['close']
+        buffer.append({'open': row['open'], 'high': row['high'], 'low': row['low'], 'close': row['close'], 'time': bar_time})
+        if len(buffer) < buffer_size:
+            continue
+        if last_bar_time is not None and bar_time <= last_bar_time:
+            continue
+        last_bar_time = bar_time
+        df_temp = pd.DataFrame(list(buffer)).set_index('time')
+        df_feat = features_fn(df_temp)
+        if df_feat.empty:
+            continue
+        df_feat = df_feat.dropna()
+        features_row = df_feat.iloc[-1:]
+        signal, prob = signal_fn(features_row, model=model, scaler=scaler)
+        bet_size = risk_fn(balance, prob, signal)
+        pnl = 0
+        if signal and bet_size > 0:
+            future_idx = min(i+1, len(df_ticks)-1)
+            future_close = df_ticks.iloc[future_idx]['close']
+            if signal == 'CALL':
+                pnl = (future_close - price) * (bet_size / price)
+            elif signal == 'PUT':
+                pnl = (price - future_close) * (bet_size / price)
+            balance += pnl
+            max_balance = max(max_balance, balance)
+            if verbose:
+                print(f"{bar_time}: {signal} | Prob: {prob:.3f} | Bet: {bet_size:.2f} | PnL: {pnl:.2f} | Balance: {balance:.2f}")
+        equity_curve.append(balance)
+        log.append({
+            'time': bar_time,
+            'signal': signal,
+            'prob': prob,
+            'bet': bet_size,
+            'pnl': pnl,
+            'balance': balance,
+            'drawdown': (max_balance - balance) / max_balance,
+        })
+    df_log = pd.DataFrame(log)
+    # Reportes automáticos
+    df_log['hour'] = pd.to_datetime(df_log['time']).dt.hour
+    df_log['day'] = pd.to_datetime(df_log['time']).dt.date
+    print("Resultados por hora:\n", df_log.groupby('hour')['pnl'].sum())
+    print("Resultados por día:\n", df_log.groupby('day')['pnl'].sum())
+    print("Máximo drawdown:", df_log['drawdown'].max())
+    plt.figure(figsize=(12,5))
+    plt.plot(df_log['time'], df_log['balance'])
+    plt.title('Equity curve')
+    plt.show()
+    try:
+        profile = df_log.profile_report(title="Backtest Report")
+        profile.to_file("backtest_report.html")
+    except Exception:
+        pass
+    return df_log
+
+def generar_reporte_diario(log_path="registro_operaciones_3m.csv", output_path=None):
+    df = pd.read_csv(log_path, parse_dates=['datetime'])
+    df['day'] = df['datetime'].dt.date
+
+    for dia, df_day in df.groupby('day'):
+        total_ops = len(df_day)
+        wins = (df_day['profit'] > 0).sum()
+        winrate = wins / total_ops if total_ops else 0
+        profit = df_day['profit'].sum()
+        balance_final = df_day['profit'].cumsum().iloc[-1] if not df_day.empty else None
+        equity = df_day['profit'].cumsum()
+        rolling_max = equity.cummax()
+        drawdown = ((rolling_max - equity).max() if not equity.empty else 0)
+        breakdown = []
+        for tipo in ['CALL', 'PUT']:
+            subset = df_day[df_day['tipo_senal'] == tipo]
+            n = len(subset)
+            w = (subset['profit'] > 0).sum()
+            wr = w / n if n else 0
+            pf = subset['profit'].sum()
+            breakdown.append(f"{tipo}: {n} ops | Winrate: {wr:.2%} | Net: {pf:.2f}")
+        reporte = (
+            f"📊 Reporte diario del {dia}\n"
+            f"Operaciones totales: {total_ops}\n"
+            f"Winrate: {winrate:.2%}\n"
+            f"Ganancia/Pérdida neta: {profit:.2f}\n"
+            f"Drawdown máximo: {drawdown:.2f}\n"
+            f"Balance relativo: {balance_final:.2f}\n"
+            "Breakdown por tipo de señal:\n  " + "\n  ".join(breakdown) + "\n"
+            "------------------------\n"
+        )
+        nombre_archivo = output_path or f"reporte_diario_{dia}.txt"
+        with open(nombre_archivo, "w") as f:
+            f.write(reporte)
+        print(f"Reporte diario guardado en {nombre_archivo}")
+        print(reporte)
+
+def enviar_reporte_diario_por_telegram(log_path="registro_operaciones_3m.csv"):
+    import os
+    df = pd.read_csv(log_path, parse_dates=['datetime'])
+    ultimo_dia = df['datetime'].dt.date.max()
+    reporte_path = f"reporte_diario_{ultimo_dia}.txt"
+    generar_reporte_diario(log_path, reporte_path)
+    if os.path.exists(reporte_path):
+        with open(reporte_path, "r") as f:
+            mensaje = f.read()
+        send_telegram_alert(mensaje)
+        print(f"✅ Reporte diario enviado por Telegram ({reporte_path})")
+    else:
+        print("❌ No se encontró el reporte diario para enviar por Telegram.")
+
+"""
+async def websocket_keepalive(ws, interval=300):
+    while True:
+        try:
+            await ws.send(json.dumps({"ping": 1}))
+            print("🟢 Ping enviado al WebSocket.")
+        except Exception as e:
+            print(f"❌ Error enviando ping al WebSocket: {e}")
+            break  # <-- sale del ciclo si hay error
+        await asyncio.sleep(interval)
+"""
+
+def get_dynamic_thresholds(volatility, hour, threshold_call, threshold_put):
+    """
+    Devuelve los thresholds dinámicos.
+    Puedes modificar esta función para que los umbrales cambien según la volatilidad u hora.
+    Por ahora, solo devuelve los valores estáticos.
+    """
+    return threshold_call, threshold_put
+
+
+async def main_operar_en_vivo_reconnect():
+    reconnect_attempts = 0
+    while True:
+        try:
+            print("🟢 Intentando conectar al WebSocket y operar en vivo...")
+            await main_operar_en_vivo()  # Tu función de trading principal
+            print("✅ main_operar_en_vivo() finalizó normalmente.")
+            break  # Sal del bucle si termina normalmente (rara vez)
+        except websockets.ConnectionClosedError as e:
+            reconnect_attempts += 1
+            delay = min(BASE_RECONNECT_DELAY * (2 ** (reconnect_attempts - 1)), MAX_RECONNECT_DELAY)
+            print(f"WebSocket cerrado ({reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}) reintentando en {delay}s: {e}")
+            if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                print("🚨 ¡Demasiados intentos de reconexión fallidos! Deteniendo bot.")
+                send_telegram_alert("🚨 ¡Demasiados intentos de reconexión WebSocket! Bot detenido.")
+                break
+            await asyncio.sleep(delay)
+        except Exception as e:
+            reconnect_attempts += 1
+            delay = min(BASE_RECONNECT_DELAY * (2 ** (reconnect_attempts - 1)), MAX_RECONNECT_DELAY)
+            print(f"Error inesperado ({reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}) reintentando en {delay}s: {e}")
+            if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                print("🚨 ¡Demasiados errores inesperados! Deteniendo bot.")
+                send_telegram_alert("🚨 ¡Demasiados errores inesperados! Bot detenido.")
+                break
+            await asyncio.sleep(delay)
+        else:
+            reconnect_attempts = 0  # Si todo fue bien, resetea el contador
+
+
+# --- FUNCION PRINCIPAL DE OPERACION ---
+async def main_operar_en_vivo():
+    # --- CONTADORES DE SEÑALES ---
+    num_signals_raw = 0
+    num_signals_rsi_filtered = 0
+    num_signals_micro_filtered = 0
+    num_signals_executed = 0
+
+    # --- CARGA DE MODELOS Y PARÁMETROS ---
+    nn_model = tf.keras.models.load_model(MODEL_FILE)
+    rf = joblib.load(RF_FILE)
+    xgb = joblib.load(XGB_FILE)
+    stack_model = joblib.load(STACK_FILE)
+    thres = json.load(open(THRESHOLD_FILE))
+    threshold_call, threshold_put = thres['threshold_call'], thres['threshold_put']
+
+    features = json.load(open(FEATURES_FILE))
+    scaler = joblib.load(SCALER_FILE)
+    df_hist = pd.read_csv(HIST_FILE, parse_dates=['time']).set_index('time')
+    buffer = deque(maxlen=BUFFER_SIZE)
+    for _, row in df_hist.iloc[-BUFFER_SIZE:].iterrows():
+        buffer.append({'open': row['open'], 'high': row['high'],
+                       'low': row['low'], 'close': row['close'],
+                       'time': row.name})
+
+    INITIAL_BALANCE = None
+    max_drawdown = 0
+    losses_in_a_row = 0
+    best_hours = cargar_mejores_horas()
+    print(f"🤖 Bot listo para operar en vivo. Horas permitidas (UTC): {best_hours}")
+
+    current_3m = None
+    bar = {}
+    dia_actual = None
+    ops = 0
+
+
+    async with websockets.connect(URL) as ws:
+        # Lanzar keepalive
+        #asyncio.create_task(websocket_keepalive(ws, interval=30))
+
+        # SUSCRÍBETE A TICKS AQUÍ
+        await ws.send(json.dumps({
+            "ticks": SYMBOL,
+            "subscribe": 1
+        }))
+
+        while ops < MAX_OPERATIONS:
+            try:
+                tick_msg = await ws.recv()
+                if isinstance(tick_msg, str):
+                    msg = json.loads(tick_msg)
+                else:
+                    msg = tick_msg
+
+                # DEBUG: Muestra todos los mensajes
+                # print("Mensaje recibido:", msg)  # <--- DESACTIVA ESTE PRINT PARA NO VER TICK A TICK
+
+                # SOLO procesa si es tick o vela, ignora los ping y otros mensajes
+                if not (("tick" in msg and "quote" in msg["tick"]) or ("close" in msg)):
+                    continue
+
+                price = parse_price(msg)
+                tick_3m = parse_time_bucket(msg)
+                hour = tick_3m.hour
+
+                # --- LÓGICA DE CONSTRUCCIÓN DE VELAS OHLC ---
+                if current_3m is None:
+                    # Primer tick: inicia la primera vela
+                    current_3m = tick_3m
+                    bar = {'open': price, 'high': price, 'low': price, 'close': price}
+                    continue  # Espera a que la vela avance para analizar
+                elif tick_3m > current_3m:
+                    # --- Cierra la vela anterior y la agrega al buffer ---
+                    buffer.append({'open': bar['open'], 'high': bar['high'],
+                                   'low': bar['low'], 'close': bar['close'], 'time': current_3m})
+
+                    # --- ANÁLISIS Y PREDICCIÓN SOLO AL CERRAR VELA ---
+                    df_temp = pd.DataFrame(buffer).drop_duplicates('time', keep='last').set_index('time')
+                    df_feat = advanced_feature_engineering(df_temp).dropna()
+                    for col in features:
+                        if col not in df_feat.columns:
+                            df_feat[col] = 0
+                    df_feat = df_feat.fillna(0)
+                    if df_feat.empty:
+                        # Inicia nueva vela
+                        current_3m = tick_3m
+                        bar = {'open': price, 'high': price, 'low': price, 'close': price}
+                        continue
+
+                    row = df_feat.iloc[[-1]][features].values
+                    row_scaled = validate_data(scaler.transform(row))
+                    last      = df_feat.iloc[-1]
+                    rsi       = last.get('rsi_14', 50)
+                    adx       = last.get('adx_14', 0)
+                    atr       = last.get('atr_14', 0)
+                    close     = last.get('close', 1)
+                    volatility = atr / close if close else 0
+
+                    threshold_call_dyn, threshold_put_dyn = get_dynamic_thresholds(
+                        volatility, hour, threshold_call, threshold_put
+                    )
+                    umbral_vol = calcular_umbral_volatilidad_dinamico(
+                        df_feat, window=200, percentil=40, min_val=0.0002
+                    )
+
+                    num_signals_raw += 1
+
+                    signal = None
+                    prob = 0
+                    if volatility >= umbral_vol and adx >= ADX_MIN_LIVE:
+                        prob = float(stacking_ensemble_predict(row_scaled, nn_model, rf, xgb, stack_model))
+                        if prob >= threshold_call_dyn:
+                            signal = 'CALL'
+                        elif prob <= threshold_put_dyn:
+                            signal = 'PUT'
+
+                        if FILTRO_RSI:
+                            if signal == 'CALL' and rsi <= RSI_CALL_MIN:
+                                print(f"🚫 Filtro RSI CALL: {rsi:.2f} <= {RSI_CALL_MIN}")
+                                signal = None; num_signals_rsi_filtered += 1
+                            if signal == 'PUT' and rsi >= RSI_PUT_MAX:
+                                print(f"🚫 Filtro RSI PUT: {rsi:.2f} >= {RSI_PUT_MAX}")
+                                signal = None; num_signals_rsi_filtered += 1
+
+                        if signal and FILTRO_MICRO:
+                            ok = (
+                                (signal=='CALL' and last['tick_imbalance']>MICRO_TICK_IMBALANCE_CALL and
+                                last['buy_sell_pressure']>MICRO_BUYSELL_CALL and
+                                last['price_acceleration']>0) or
+                                (signal=='PUT' and last['tick_imbalance']<MICRO_TICK_IMBALANCE_PUT and
+                                last['buy_sell_pressure']<MICRO_BUYSELL_PUT and
+                                last['price_acceleration']<0)
+                            ) and last['micro_volatility']>1e-4*last['close'] \
+                              and last['direction_change_density']<MICRO_DIRECTION_CHANGE
+                            if not ok:
+                                print(f"🚫 Filtro microestructura: tick_imbalance={last['tick_imbalance']:.2f}, buy_sell_pressure={last['buy_sell_pressure']:.2f}, price_acceleration={last['price_acceleration']:.5f}, micro_volatility={last['micro_volatility']:.5f}, direction_change_density={last['direction_change_density']:.2f}")
+                                signal = None
+                                num_signals_micro_filtered += 1
+
+                    else:
+                        print(f"⏸️ Mercado sin tendencia/volatilidad (vol={volatility:.4f}, adx={adx:.2f}).")
+
+                    if dia_actual is None:
+                        dia_actual = current_3m.date()
+                    elif tick_5m.date() != dia_actual:
+                        generar_reporte_diario(OPERACIONES_FILE, f"reporte_diario_{dia_actual}.txt")
+                        with open(f"reporte_diario_{dia_actual}.txt") as f:
+                            send_telegram_alert(f.read())
+                        ops = 0
+                        losses_in_a_row = 0
+                        dia_actual      = tick_3m.date()
+                        print(f"=== Nuevo día: {dia_actual}. Contadores reiniciados. ===")
+
+                    vela_time = current_3m.strftime("%Y-%m-%d %H:%M:%S")
+                    resultado_op = None
+                    profit_op = None
+
+                    if signal:
+                        num_signals_executed += 1
+                        if INITIAL_BALANCE is None:
+                            INITIAL_BALANCE = await get_balance(ws)
+                        balance_actual = await get_balance(ws)
+                        drawdown = (INITIAL_BALANCE - balance_actual) / INITIAL_BALANCE
+                        if drawdown > DRAWDOWN_THRESHOLD or drawdown >= STOP_LOSS_DAILY:
+                            print("🚨 Drawdown alcanzado. Fin sesión.")
+                            break
+                        if losses_in_a_row >= MAX_LOSSES_IN_A_ROW:
+                            print("🚨 Máximo pérdidas seguidas. Fin sesión.")
+                            break
+
+                        monto  = round(balance_actual * 0.05, 2)
+                        buy_id = await ejecutar_operacion_deriv(ws, signal, monto)
+                        if buy_id:
+                            profit, status = await esperar_resultado_operacion(ws, buy_id, stake=monto)
+                            guardar_operacion(datetime.utcnow(), signal, monto, prob, status, profit)
+                            resultado = 'GANADA 🎉' if profit>0 else 'PERDIDA ❌'
+                            print(f"   ▶️ {resultado}, {profit:+.2f} USD")
+                            ops += 1
+                            losses_in_a_row = losses_in_a_row+1 if status=="perdida" else 0
+
+                    else:
+                        if prob >= threshold_call_dyn or prob <= threshold_put_dyn:
+                            print("⏸️ Señal filtrada. No se opera.")
+
+                    mostrar_info_vela(
+                        vela_time=vela_time,
+                        bar=bar,
+                        prob=prob,
+                        atr=atr,
+                        adx=adx,
+                        rsi=rsi,
+                        umbral_vol=umbral_vol,
+                        hour=hour,
+                        signal=signal,
+                        resultado=resultado_op,
+                        profit=profit_op
+                    )
+
+                    # Inicia nueva vela
+                    current_5m = tick_5m
+                    bar = {'open': price, 'high': price, 'low': price, 'close': price}
+                else:
+                    # Actualiza la vela actual
+                    bar['high'] = max(bar['high'], price)
+                    bar['low'] = min(bar['low'], price)
+                    bar['close'] = price
+
+            except websockets.ConnectionClosedError as e:
+                #print(f"WebSocket cerrado, reintentando en 5s: {e}")
+                await asyncio.sleep(5)
+            except Exception as e:
+                #print(f"Error inesperado, reintentando en 5s: {e}")
+                await asyncio.sleep(5)
+
+    # --- RESUMEN FINAL ---
+    print("\n--- Resumen de señales ---")
+    print(f"Señales brutas del modelo:          {num_signals_raw}")
+    print(f"Filtradas por RSI:                  {num_signals_rsi_filtered}")
+    print(f"Filtradas por microestructura:      {num_signals_micro_filtered}")
+    print(f"Señales ejecutadas:                 {num_signals_executed}")
+
+def mostrar_info_vela(vela_time, bar, prob, atr, adx, rsi, umbral_vol, hour, signal=None, resultado=None, profit=None):
+    """
+    Muestra la información relevante de cada vela de 3 minutos, los indicadores técnicos y la señal generada.
+
+    Args:
+        vela_time (str): Timestamp de la vela en formato string.
+        bar (dict): Diccionario con los valores OHLC de la vela.
+        prob (float): Probabilidad predicha por el modelo.
+        atr (float): Valor del ATR (Average True Range).
+        adx (float): Valor del ADX (Average Directional Index).
+        rsi (float): Valor del RSI.
+        umbral_vol (float): Umbral de volatilidad calculado dinámicamente.
+        hour (int): Hora UTC de la vela.
+        signal (str, opcional): Señal generada, "CALL" o "PUT".
+        resultado (str, opcional): Estado de la operación ("GANADA", "PERDIDA").
+        profit (float, opcional): Ganancia o pérdida de la operación.
+    """
+    open_ = bar.get('open', 0)
+    high = bar.get('high', 0)
+    low = bar.get('low', 0)
+    close = bar.get('close', 0)
+    volatility = atr / close if close else 0
+
+    print(
+        f"🕒 Vela {vela_time}: "
+        f"O:{open_:.2f} H:{high:.2f} L:{low:.2f} C:{close:.2f} | "
+        f"Probabilidad: {prob:.4f} | ATR/close: {volatility:.4f} | ADX: {adx:.2f} | RSI: {rsi:.2f} | "
+        f"Umbral vol: {umbral_vol:.4f} | Hora: {hour}"
+    )
+    if signal:
+        print(f"⏰ Señal {signal} en {vela_time} (hora {hour} UTC)")
+        if resultado is not None and profit is not None:
+            status = 'GANADA 🎉' if resultado == 'GANADA' else 'PERDIDA ❌'
+            print(f"✅ Operación {'ganada' if resultado == 'GANADA' else 'perdida'}. Resultado: {profit:+.2f} USD")
+            print(f"   ▶️ Resultado: {status}, {profit:+.2f} USD")
+    else:
+        print(f"⏸️ Sin señal en esta vela.")
+
+
+def analizar_adx():
+    import matplotlib.pyplot as plt  # <-- agrega esto
+    df = pd.read_csv("velas_R_10_3m.csv", parse_dates=['time'])
+    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+    df = pd.concat([df, adx], axis=1)
+    print("ADX actual (última barra):", df['ADX_14'].iloc[-1])
+    print("Resumen estadístico del ADX:")
+    print(df['ADX_14'].describe())
+    plt.figure(figsize=(10,5))
+    plt.hist(df['ADX_14'].dropna(), bins=50, color='skyblue', edgecolor='k')
+    plt.axvline(ADX_MIN_LIVE, color='red', linestyle='--', label=f'Umbral ADX_MIN_LIVE ({ADX_MIN_LIVE})')
+    plt.title('Distribución del ADX 14')
+    plt.xlabel('ADX')
+    plt.ylabel('Frecuencia')
+    plt.legend()
+    plt.show()
+
+# Variable global para guardar el hilo del ping
+if 'ping_thread' not in globals():
+    ping_thread = None
+
+def keep_colab_awake(interval=300):
+    import time
+    while True:
+        print("🔄 Ping para mantener Colab despierto...")
+        time.sleep(interval)
+
+# Solo lanza el ping si no está ya corriendo
+if ping_thread is None or not ping_thread.is_alive():
+    ping_thread = threading.Thread(target=keep_colab_awake, args=(300,), daemon=True)
+    ping_thread.start()
+    print("Ping iniciado.")
+else:
+    print("Ping ya estaba corriendo.")
+
+if __name__ == "__main__":
+    modelos_faltan = (
+        not os.path.exists(XGB_FILE)
+        or not os.path.exists(SCALER_FILE)
+        or not os.path.exists(RF_FILE)
+        or not os.path.exists(MODEL_FILE)
+        or not os.path.exists(STACK_FILE)
+    )
+    if modelos_faltan:
+        print("No existen todos los modelos entrenados, entrenando...")
+        features = train_and_validate()
+    else:
+        print("Modelos ya entrenados, continuando...")
+    try:
+        analizar_adx()
+        features = train_and_validate()
+        asyncio.run(main_operar_en_vivo())
+        analizar_operaciones_equity()
+    except KeyboardInterrupt:
+        print("⚠️ Bot detenido manualmente.")
+        send_telegram_alert("⚠️ Bot detenido manualmente.")
+        analizar_operaciones_equity()
+    except Exception as e:
+        print(f"❌ Error fatal: {e}")
+        send_telegram_alert(f"❌ Error fatal: {e}")
+        analizar_operaciones_equity()
+
+"""
+
+
+if __name__ == "__main__":
+    # Paso 0: Descargar el histórico si no existe
+    if not os.path.exists(HIST_FILE):
+        print(f"Archivo {HIST_FILE} no encontrado. Descargando histórico de velas...")
+        asyncio.run(download_candles())
+    else:
+        print(f"Archivo {HIST_FILE} encontrado.")
+
+    # Paso 1: Analiza el ADX histórico (opcional)
+    analizar_adx()
+
+    # Paso 2: Chequea modelos entrenados
+    modelos_faltan = (
+        not os.path.exists(XGB_FILE)
+        or not os.path.exists(SCALER_FILE)
+        or not os.path.exists(RF_FILE)
+        or not os.path.exists(MODEL_FILE)
+        or not os.path.exists(STACK_FILE)
+    )
+    if modelos_faltan:
+        print("No existen todos los modelos entrenados, entrenando...")
+        features = train_and_validate()
+    else:
+        print("Modelos ya entrenados, continuando...")
+
+    # Paso 3: Ejecuta SOLO el loop de trading (esto imprime vela, indicadores, probabilidad y opera si hay señal)
+    asyncio.run(main_operar_en_vivo())
+
+"""
+def evaluar_backtest(path_log="backtest_log.csv"):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    df = pd.read_csv(path_log, parse_dates=['time'])
+    plt.figure(figsize=(12,6))
+    plt.plot(df['time'], df['balance'], label='Equity curve')
+    plt.title('Equity Curve')
+    plt.xlabel('Fecha/Hora')
+    plt.ylabel('Balance')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    rolling_max = df['balance'].cummax()
+    drawdown = (rolling_max - df['balance']) / rolling_max
+    max_dd = drawdown.max()
+    print(f"Máximo Drawdown: {max_dd:.2%}")
+
+    trades = df[df['signal'].notnull()]
+    wins = trades[trades['pnl'] > 0]
+    losses = trades[trades['pnl'] < 0]
+    winrate = len(wins) / max(1, len(trades))
+    profit_factor = wins['pnl'].sum() / (-losses['pnl'].sum()) if len(losses) > 0 else np.nan
+    print(f"Winrate: {winrate:.2%}")
+    print(f"Profit Factor: {profit_factor:.2f}")
+
+    print("\nResultado por hora:")
+    print(trades.groupby('hour')['pnl'].sum())
+    print("\nResultado por día:")
+    print(trades.groupby('day')['pnl'].sum())
+
+    plt.figure(figsize=(12,4))
+    plt.hist(trades['pnl'], bins=50)
+    plt.title('Distribución de PnL por trade')
+    plt.grid()
+    plt.show()
+
